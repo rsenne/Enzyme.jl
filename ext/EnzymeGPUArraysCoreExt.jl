@@ -6,6 +6,7 @@ using LinearAlgebra: LinearAlgebra, dot
 using Enzyme.EnzymeCore: EnzymeCore
 using Enzyme.EnzymeCore.EnzymeRules:
     EnzymeRules,
+    FwdConfig,
     RevConfig,
     Annotation,
     augmented_rule_return_type,
@@ -347,6 +348,67 @@ end
     return (dα, dβ)
 end
 
+#=
+Forward mode through the same entry points:
+
+    dC = α·(op(dA)·op(B) + op(A)·op(dB)) + dα·op(A)·op(B) + β·dC₀ + dβ·C₀
+
+`prod!(D, L, R, a, b)` is the primal call on other operands, `D = a·op(L)·op(R) + b·D`,
+so each product term accumulates into the shadow with b = 1. The β·dC₀ and dβ·C₀
+terms go first, while `C` still holds C₀.
+
+The wrapper chars pass through unchanged. A Symmetric/Hermitian operand is fine
+here: the product is linear in the stored triangle, and so is its tangent.
+
+Without these, forward mode descends into the backend. On CUDA that is cuBLAS,
+whose `CuRef` allocation does an atomic update that Enzyme's forward pass
+currently fails to verify.
+=#
+@inline function _matmul_forward!(config, prod!::F, C, A, B, αval, βval, dα, dβ) where {F}
+    _isconst(config, C) && return nothing
+    N = width(config)
+    a_const = _isconst(config, A)
+    b_const = _isconst(config, B)
+    for i in 1:N
+        dC = _bget(C.dval, Val(N), i)
+        # β = 0 (3-arg `mul!` passes `false`) has to drop dC₀ like the primal drops
+        # C₀, not scale it: the shadow of a fresh output buffer can hold NaNs.
+        if dβ === nothing
+            if iszero(βval)
+                fill!(dC, zero(eltype(dC)))
+            elseif !isone(βval)
+                dC .*= βval
+            end
+        else
+            dβi = _bget(dβ, Val(N), i)
+            if iszero(βval)
+                dC .= dβi .* C.val
+            else
+                dC .= βval .* dC .+ dβi .* C.val
+            end
+        end
+        a_const || prod!(dC, _bget(A.dval, Val(N), i), B.val, αval, true)
+        b_const || prod!(dC, A.val, _bget(B.dval, Val(N), i), αval, true)
+        dα === nothing || prod!(dC, A.val, B.val, _bget(dα, Val(N), i), true)
+    end
+    return nothing
+end
+
+# The forward return for a rule whose result is its first argument, mutated.
+@inline function _fwdreturn(config, C::Annotation)
+    return if needs_primal(config) && needs_shadow(config)
+        C
+    elseif needs_shadow(config)
+        C.dval
+    elseif needs_primal(config)
+        C.val
+    else
+        nothing
+    end
+end
+
+@inline _skip_primal(x::Annotation) = x isa DuplicatedNoNeed || x isa BatchDuplicatedNoNeed
+
 @static if VERSION < v"1.12.0-DEV"
 
     # Here α and β are one `MulAddMul`, so an active α or β is a single active
@@ -364,6 +426,52 @@ end
     @inline _dmuladdmul(::Val{1}, ::Type{MAM}, dα, dβ) where {MAM} = MAM(dα, dβ)
     @inline function _dmuladdmul(::Val{N}, ::Type{MAM}, dα, dβ) where {N, MAM}
         return ntuple(_PackMulAddMul{MAM}(dα, dβ), Val(N))
+    end
+
+    # A `MulAddMul` shadow split into its α and β parts, tuples when batched. It
+    # is passed by reference, so under runtime activity a constant one arrives
+    # with its shadow aliasing the primal; reading that as a tangent would add
+    # α·op(A)·op(B) + β·C₀ to dC.
+    @inline _mam_split(config, add::Annotation, w::Val) =
+        _isconst(config, add) ? (nothing, nothing) : _mam_parts(add.dval, w)
+    @inline _mam_parts(d, ::Val{1}) = (d.alpha, d.beta)
+    @inline _mam_parts(d, ::Val{N}) where {N} = (map(m -> m.alpha, d), map(m -> m.beta, d))
+
+    function EnzymeRules.forward(
+            config::FwdConfig,
+            func::Const{typeof(_matmat_entry)},
+            ::Type{RT},
+            C::Annotation{<:AbstractGPUVecOrMat},
+            tA::Const{<:AbstractChar},
+            tB::Const{<:AbstractChar},
+            A::Annotation{<:AbstractGPUVecOrMat},
+            B::Annotation{<:AbstractGPUVecOrMat},
+            add::Annotation{<:LinearAlgebra.MulAddMul},
+        ) where {RT}
+        f, ta, tb = func.val, tA.val, tB.val
+        prod!(D, L, R, a, b) = f(D, ta, tb, L, R, LinearAlgebra.MulAddMul(a, b))
+        dα, dβ = _mam_split(config, add, Val(width(config)))
+        _matmul_forward!(config, prod!, C, A, B, add.val.alpha, add.val.beta, dα, dβ)
+        _skip_primal(C) || f(C.val, ta, tb, A.val, B.val, add.val)
+        return _fwdreturn(config, C)
+    end
+
+    function EnzymeRules.forward(
+            config::FwdConfig,
+            func::Const{typeof(_matvec_entry)},
+            ::Type{RT},
+            y::Annotation{<:AbstractGPUVector},
+            tA::Const{<:AbstractChar},
+            A::Annotation{<:AbstractGPUMatrix},
+            x::Annotation{<:AbstractGPUVector},
+            add::Annotation{<:LinearAlgebra.MulAddMul},
+        ) where {RT}
+        f, ta = func.val, tA.val
+        prod!(D, L, R, a, b) = f(D, ta, L, R, LinearAlgebra.MulAddMul(a, b))
+        dα, dβ = _mam_split(config, add, Val(width(config)))
+        _matmul_forward!(config, prod!, y, A, x, add.val.alpha, add.val.beta, dα, dβ)
+        _skip_primal(y) || f(y.val, ta, A.val, x.val, add.val)
+        return _fwdreturn(config, y)
     end
 
     function EnzymeRules.augmented_primal(
@@ -454,6 +562,46 @@ end
 
 else
 
+    @inline _dshadow(::Const) = nothing
+    @inline _dshadow(x::Annotation) = x.dval
+
+    function EnzymeRules.forward(
+            config::FwdConfig,
+            func::Const{<:_MatmatEntry},
+            ::Type{RT},
+            C::Annotation{<:AbstractGPUVecOrMat},
+            tA::Const{<:AbstractChar},
+            tB::Const{<:AbstractChar},
+            A::Annotation{<:AbstractGPUVecOrMat},
+            B::Annotation{<:AbstractGPUVecOrMat},
+            α::Annotation{<:Number},
+            β::Annotation{<:Number},
+        ) where {RT}
+        f, ta, tb = func.val, tA.val, tB.val
+        prod!(D, L, R, a, b) = f(D, ta, tb, L, R, a, b)
+        _matmul_forward!(config, prod!, C, A, B, α.val, β.val, _dshadow(α), _dshadow(β))
+        _skip_primal(C) || f(C.val, ta, tb, A.val, B.val, α.val, β.val)
+        return _fwdreturn(config, C)
+    end
+
+    function EnzymeRules.forward(
+            config::FwdConfig,
+            func::Const{<:_MatvecEntry},
+            ::Type{RT},
+            y::Annotation{<:AbstractGPUVector},
+            tA::Const{<:AbstractChar},
+            A::Annotation{<:AbstractGPUMatrix},
+            x::Annotation{<:AbstractGPUVector},
+            α::Annotation{<:Number},
+            β::Annotation{<:Number},
+        ) where {RT}
+        f, ta = func.val, tA.val
+        prod!(D, L, R, a, b) = f(D, ta, L, R, a, b)
+        _matmul_forward!(config, prod!, y, A, x, α.val, β.val, _dshadow(α), _dshadow(β))
+        _skip_primal(y) || f(y.val, ta, A.val, x.val, α.val, β.val)
+        return _fwdreturn(config, y)
+    end
+
     function EnzymeRules.augmented_primal(
             config::RevConfig,
             func::Const{<:_MatmatEntry},
@@ -541,7 +689,47 @@ else
 end
 
 # dot(a, b) = Σ conj(aᵢ)·bᵢ, so `da += conj(dr)·b` and `db += dr·a`. The asymmetry
-# only shows up for complex eltypes.
+# only shows up for complex eltypes. Going forward the tangent is
+# `dot(da, b) + dot(a, db)`; `dot` already conjugates its first argument.
+
+# Batch element `i`'s tangent of `dot(a, b)`. A struct instead of a closure so
+# `ntuple` gets something concrete.
+struct _DotTangent{T, W, A, B}
+    a::A
+    b::B
+    a_const::Bool
+    b_const::Bool
+end
+@inline _DotTangent{T, W}(a::A, b::B, a_const, b_const) where {T, W, A, B} =
+    _DotTangent{T, W, A, B}(a, b, a_const, b_const)
+@inline function (f::_DotTangent{T, W})(i::Int) where {T, W}
+    da = f.a_const ? zero(T) : T(dot(_bget(f.a.dval, Val(W), i), f.b.val))
+    db = f.b_const ? zero(T) : T(dot(f.a.val, _bget(f.b.dval, Val(W), i)))
+    return da + db
+end
+
+@inline _dottangent(w::Val{1}, f) = f(1)
+@inline _dottangent(w::Val{N}, f) where {N} = ntuple(f, w)
+
+@inline _dual(::Val{1}, primal, shadow) = Duplicated(primal, shadow)
+@inline _dual(::Val{N}, primal, shadow) where {N} = BatchDuplicated(primal, shadow)
+
+function EnzymeRules.forward(
+        config::FwdConfig,
+        func::Const{typeof(dot)},
+        ::Type{RT},
+        a::Annotation{<:AbstractGPUArray},
+        b::Annotation{<:AbstractGPUArray},
+    ) where {RT}
+    primal = needs_primal(config) ? func.val(a.val, b.val) : nothing
+    needs_shadow(config) || return primal
+    T = Base.promote_op(dot, eltype(a.val), eltype(b.val))
+    w = Val(width(config))
+    shadow = _dottangent(
+        w, _DotTangent{T, width(config)}(a, b, _isconst(config, a), _isconst(config, b)),
+    )
+    return needs_primal(config) ? _dual(w, primal, shadow) : shadow
+end
 
 function EnzymeRules.augmented_primal(
         config::RevConfig,

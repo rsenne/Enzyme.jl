@@ -490,6 +490,104 @@ test/ext/jlarrays.jl for why, and for the rest of the coverage).
             Duplicated(Symmetric(cu(X0), :U), Symmetric(dX, :U)), Const(cu(randn(Float32, n, 3))),
         )
     end
+
+    # Without forward rules, forward mode descends into CUBLAS and aborts with
+    # "PHI nodes not grouped at top of basic block".
+    @testset "matvec forward" begin
+        A0 = randn(Float32, 6, 3)
+        x0, dx0 = randn(Float32, 3), randn(Float32, 3)
+        r = Enzyme.autodiff(Forward, (A, x) -> A * x, Duplicated, Const(cu(A0)), Duplicated(cu(x0), cu(dx0)))
+        @test Array(only(r)) ≈ A0 * dx0
+        y0, dy0 = randn(Float32, 6), randn(Float32, 6)
+        r = Enzyme.autodiff(Forward, (A, y) -> transpose(A) * y, Duplicated, Const(cu(A0)), Duplicated(cu(y0), cu(dy0)))
+        @test Array(only(r)) ≈ transpose(A0) * dy0
+    end
+
+    @testset "matmul forward" begin
+        A0, dA0 = randn(Float32, 3, 4), randn(Float32, 3, 4)
+        B0, dB0 = randn(Float32, 4, 2), randn(Float32, 4, 2)
+        r = Enzyme.autodiff(
+            ForwardWithPrimal, (A, B) -> A * B, Duplicated,
+            Duplicated(cu(A0), cu(dA0)), Duplicated(cu(B0), cu(dB0)),
+        )
+        @test Array(r[1]) ≈ dA0 * B0 + A0 * dB0
+        @test Array(r[2]) ≈ A0 * B0
+    end
+
+    @testset "mul! forward, Duplicated alpha/beta" begin
+        A0, dA0 = randn(Float32, 3, 4), randn(Float32, 3, 4)
+        B0 = randn(Float32, 4, 2)
+        C0, dC0 = randn(Float32, 3, 2), randn(Float32, 3, 2)
+        function muladd!(C, A, B, α, β)
+            mul!(C, A, B, α, β)
+            return nothing
+        end
+        dC = cu(dC0)
+        Enzyme.autodiff(
+            Forward, muladd!, Const,
+            Duplicated(cu(C0), dC), Duplicated(cu(A0), cu(dA0)), Const(cu(B0)),
+            Duplicated(2.0f0, 0.25f0), Duplicated(0.5f0, -1.0f0),
+        )
+        @test Array(dC) ≈ 2 * dA0 * B0 + 0.25f0 * A0 * B0 + 0.5f0 * dC0 - C0
+    end
+
+    @testset "dot forward" begin
+        a0, da0 = randn(Float32, 8), randn(Float32, 8)
+        b0, db0 = randn(Float32, 8), randn(Float32, 8)
+        r = Enzyme.autodiff(Forward, dot, Duplicated, Duplicated(cu(a0), cu(da0)), Duplicated(cu(b0), cu(db0)))
+        @test only(r) ≈ dot(da0, b0) + dot(a0, db0)
+    end
+
+    #=
+    Forward over reverse: the forward pass runs through the reverse rules' own
+    matmuls and lands on the forward rules. f(x) = xᵀAᵀAx, so H = 2AᵀA.
+
+    Kept away from two problems elsewhere:
+    - The intermediates go into preallocated buffers. With the allocating `A * x`
+      the forward pass also goes through CUDA.jl's rule for the `CuArray`
+      constructor, whose `fill!` of the new shadow fails type analysis.
+    - Every array is `Duplicated`. A `Const` `A` needs runtime activity once the
+      reverse rule caches a copy of it, and under runtime activity that copy's
+      shadow is a copy of `A` itself, which then reads as a nonzero tangent.
+
+    On Julia 1.12 the forward pass through the GPUArrays broadcast kernels in the
+    reverse rules still fails with a `CallingConventionMismatchError`
+    (EnzymeAD/Enzyme.jl#2707).
+    =#
+    @testset "Hessian-vector product" begin
+        A0 = randn(Float32, 5, 3)
+        x0, v0 = randn(Float32, 3), randn(Float32, 3)
+        function f!(x, A, z, y)
+            mul!(z, A, x)
+            mul!(y, transpose(A), z)
+            return dot(x, y)
+        end
+        function grad!(dx, x, A, dA, z, dz, y, dy)
+            Enzyme.autodiff_deferred(
+                Reverse, Const(f!), Active,
+                Duplicated(x, dx), Duplicated(A, dA), Duplicated(z, dz), Duplicated(y, dy),
+            )
+            return nothing
+        end
+        z(n...) = cu(zeros(Float32, n...))
+        function hvp_matches()
+            dx, hv = z(3), z(3)
+            Enzyme.autodiff(
+                Forward, grad!, Const,
+                Duplicated(dx, hv), Duplicated(cu(x0), cu(v0)),
+                Duplicated(cu(A0), z(5, 3)), Duplicated(z(5, 3), z(5, 3)),
+                Duplicated(z(5), z(5)), Duplicated(z(5), z(5)),
+                Duplicated(z(3), z(3)), Duplicated(z(3), z(3)),
+            )
+            return Array(dx) ≈ 2 * transpose(A0) * (A0 * x0) &&
+                Array(hv) ≈ 2 * transpose(A0) * (A0 * v0)
+        end
+        if VERSION >= v"1.12"
+            @test_broken hvp_matches()
+        else
+            @test hvp_matches()
+        end
+    end
 end
 
 # A view or reshape shares the buffer of its parent and retains it. The shadow view

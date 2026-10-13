@@ -294,6 +294,184 @@ output and doesn't happen on CUDA.
 end
 
 #=
+Forward mode through the same entry points. The output shadow is overwritten with
+the tangent `α·(op(dA)·op(B) + op(A)·op(dB)) + dα·op(A)·op(B) + β·dC₀ + dβ·C₀`, so
+each test checks it against that expression on plain arrays.
+=#
+@testset "GPUArrays linalg forward rules" begin
+    jl(x) = JLArray(x)
+
+    function matmul!(C, A, B)
+        mul!(C, A, B)
+        return nothing
+    end
+
+    @testset "matmul forward" begin
+        A0, dA0 = randn(3, 4), randn(3, 4)
+        B0, dB0 = randn(4, 2), randn(4, 2)
+        C = jl(zeros(3, 2))
+        dC = jl(zeros(3, 2))
+        Enzyme.autodiff(
+            Forward, matmul!, Const,
+            Duplicated(C, dC), Duplicated(jl(A0), jl(dA0)), Duplicated(jl(B0), jl(dB0)),
+        )
+        @test collect(C) ≈ A0 * B0
+        @test collect(dC) ≈ dA0 * B0 + A0 * dB0
+    end
+
+    # 3-arg `mul!` passes β = false, which has to drop the incoming shadow instead
+    # of scaling it, or the NaNs survive.
+    @testset "matmul forward ignores the incoming output shadow" begin
+        A0, dA0 = randn(3, 4), randn(3, 4)
+        B0 = randn(4, 2)
+        dC = jl(fill(NaN, 3, 2))
+        Enzyme.autodiff(
+            Forward, matmul!, Const,
+            Duplicated(jl(zeros(3, 2)), dC), Duplicated(jl(A0), jl(dA0)), Const(jl(B0)),
+        )
+        @test collect(dC) ≈ dA0 * B0
+    end
+
+    @testset "batched matmul forward" begin
+        A0 = randn(3, 4)
+        B0, dB1, dB2 = randn(4, 2), randn(4, 2), randn(4, 2)
+        dC1, dC2 = jl(zeros(3, 2)), jl(zeros(3, 2))
+        Enzyme.autodiff(
+            Forward, matmul!, Const,
+            BatchDuplicated(jl(zeros(3, 2)), (dC1, dC2)), Const(jl(A0)),
+            BatchDuplicated(jl(B0), (jl(dB1), jl(dB2))),
+        )
+        @test collect(dC1) ≈ A0 * dB1
+        @test collect(dC2) ≈ A0 * dB2
+    end
+
+    @testset "matmul forward, $name" for (name, T, wa, wb) in (
+            ("transpose(A)·B", Float64, transpose, identity),
+            ("A·transpose(B)", Float64, identity, transpose),
+            ("adjoint(A)·B, complex", ComplexF64, adjoint, identity),
+            ("transpose(A)·B, complex", ComplexF64, transpose, identity),
+            ("A·adjoint(B), complex", ComplexF64, identity, adjoint),
+            ("Symmetric(A)·B", Float64, A -> Symmetric(A, :U), identity),
+        )
+        m, k, n = 4, 4, 2
+        A0, dA0 = randn(T, m, k), randn(T, m, k)
+        B0, dB0 = randn(T, wb === identity ? (k, n) : (n, k)), randn(T, wb === identity ? (k, n) : (n, k))
+        function wrapped_mul!(C, A, B)
+            mul!(C, wa(A), wb(B))
+            return nothing
+        end
+        dC = jl(zeros(T, m, n))
+        Enzyme.autodiff(
+            Forward, wrapped_mul!, Const,
+            Duplicated(jl(zeros(T, m, n)), dC),
+            Duplicated(jl(A0), jl(dA0)), Duplicated(jl(B0), jl(dB0)),
+        )
+        @test collect(dC) ≈ wa(dA0) * wb(B0) + wa(A0) * wb(dB0)
+    end
+
+    @testset "matvec forward with transpose" begin
+        X0, dX0 = randn(6, 3), randn(6, 3)
+        β0, dβ0 = randn(3), randn(3)
+        function g!(y, z, X, β)
+            mul!(z, X, β)
+            mul!(y, transpose(X), z)
+            return nothing
+        end
+        dy = jl(zeros(3))
+        Enzyme.autodiff(
+            Forward, g!, Const,
+            Duplicated(jl(zeros(3)), dy), Duplicated(jl(zeros(6)), jl(zeros(6))),
+            Duplicated(jl(X0), jl(dX0)), Duplicated(jl(β0), jl(dβ0)),
+        )
+        z0, dz0 = X0 * β0, dX0 * β0 + X0 * dβ0
+        @test collect(dy) ≈ transpose(dX0) * z0 + transpose(X0) * dz0
+    end
+
+    # 5-arg `mul!`: β ≠ 0 carries dC₀ through, and Duplicated α/β add dα·A·B and
+    # dβ·C₀. Before Julia 1.12 α and β arrive as one `MulAddMul`.
+    @testset "mul! forward, beta != 0 and Duplicated alpha/beta" begin
+        A0, dA0 = randn(3, 4), randn(3, 4)
+        B0 = randn(4, 2)
+        C0, dC0 = randn(3, 2), randn(3, 2)
+        function loss!(C, A, B, α, β)
+            mul!(C, A, B, α, β)
+            return nothing
+        end
+        C = jl(copy(C0))
+        dC = jl(copy(dC0))
+        Enzyme.autodiff(
+            Forward, loss!, Const,
+            Duplicated(C, dC), Duplicated(jl(A0), jl(dA0)), Const(jl(B0)),
+            Duplicated(2.0, 0.3), Duplicated(0.5, -1.5),
+        )
+        @test collect(C) ≈ 2.0 * A0 * B0 + 0.5 * C0
+        @test collect(dC) ≈ 2.0 * dA0 * B0 + 0.3 * A0 * B0 + 0.5 * dC0 - 1.5 * C0
+
+        dC = jl(copy(dC0))
+        Enzyme.autodiff(
+            Forward, loss!, Const,
+            Duplicated(jl(copy(C0)), dC), Const(jl(A0)), Const(jl(B0)),
+            Const(2.0), Const(0.5),
+        )
+        @test collect(dC) ≈ 0.5 * dC0
+    end
+
+    @testset "batched mul! forward, Duplicated alpha" begin
+        A0 = randn(3, 4)
+        B0 = randn(4, 2)
+        function lossα!(C, A, B, α)
+            mul!(C, A, B, α, false)
+            return nothing
+        end
+        dC1, dC2 = jl(zeros(3, 2)), jl(zeros(3, 2))
+        Enzyme.autodiff(
+            Forward, lossα!, Const,
+            BatchDuplicated(jl(zeros(3, 2)), (dC1, dC2)), Const(jl(A0)), Const(jl(B0)),
+            BatchDuplicated(2.0, (1.0, -3.0)),
+        )
+        @test collect(dC1) ≈ A0 * B0
+        @test collect(dC2) ≈ -3.0 * A0 * B0
+    end
+
+    @testset "dot forward" begin
+        a0, da0 = randn(8), randn(8)
+        b0, db0 = randn(8), randn(8)
+        res = Enzyme.autodiff(
+            ForwardWithPrimal, dot, Duplicated,
+            Duplicated(jl(a0), jl(da0)), Duplicated(jl(b0), jl(db0)),
+        )
+        @test res[1] ≈ dot(da0, b0) + dot(a0, db0)
+        @test res[2] ≈ dot(a0, b0)
+        res = Enzyme.autodiff(Forward, dot, Duplicated, Const(jl(a0)), Duplicated(jl(b0), jl(db0)))
+        @test only(res) ≈ dot(a0, db0)
+    end
+
+    @testset "batched dot forward" begin
+        a0, b0 = randn(6), randn(6)
+        da1, da2 = randn(6), randn(6)
+        res = only(
+            Enzyme.autodiff(
+                Forward, dot, BatchDuplicated,
+                BatchDuplicated(jl(a0), (jl(da1), jl(da2))), Const(jl(b0)),
+            )
+        )
+        @test res[1] ≈ dot(da1, b0)
+        @test res[2] ≈ dot(da2, b0)
+    end
+
+    # `dot` conjugates its first argument, so its tangent does too.
+    @testset "dot forward, complex" begin
+        a0, da0 = randn(ComplexF64, 5), randn(ComplexF64, 5)
+        b0, db0 = randn(ComplexF64, 5), randn(ComplexF64, 5)
+        res = Enzyme.autodiff(
+            Forward, dot, Duplicated,
+            Duplicated(jl(a0), jl(da0)), Duplicated(jl(b0), jl(db0)),
+        )
+        @test only(res) ≈ sum(conj.(da0) .* b0 .+ conj.(a0) .* db0)
+    end
+end
+
+#=
 The AbstractGPUArray reduction rules. `sum`/`mapreduce` over a GPU array goes
 through `GPUArrays._mapreduce`, which allocates the output and fills it with
 `GPUArrays.mapreducedim!`; both have rules in EnzymeGPUArraysExt. Without them
